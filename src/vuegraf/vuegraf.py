@@ -9,13 +9,15 @@ import traceback
 from threading import Event
 
 # InfluxDB v1
-import influxdb
+# import influxdb
 
 # InfluxDB v2
 import influxdb_client
 
 from pyemvue import PyEmVue
 from pyemvue.enums import Scale, Unit
+
+from urllib3.exceptions import ConnectTimeoutError
 
 # flush=True helps when running in a container without a tty attached
 # (alternatively, "python -u" or PYTHONUNBUFFERED will help here)
@@ -86,15 +88,18 @@ def lookupChannelName(account, chan):
 
     return name
 
-def createDataPoint(account, chanName, watts, timestamp, detailed):
+def createDataPoint(account, chanName, watts, timestamp, detailed, transition = None):
     dataPoint = None
     if influxVersion == 2:
         dataPoint = influxdb_client.Point("energy_usage") \
             .tag("account_name", account['name']) \
             .tag("device_name", chanName) \
             .tag("detailed", detailed) \
-            .field("usage", watts) \
-            .time(time=timestamp)
+            .field("usage", watts)
+            
+        if transition is not None:
+            dataPoint.field("transition", transition)
+        dataPoint.time(time=timestamp)
     else:
         dataPoint = {
             "measurement": "energy_usage",
@@ -110,7 +115,26 @@ def createDataPoint(account, chanName, watts, timestamp, detailed):
         }
     return dataPoint
 
-def extractDataPoints(device, usageDataPoints, historyStartTime=None, historyEndTime=None):
+def getPowerTransitionValue(poweredOnState, powerUsage):
+    transition = None
+    
+    if poweredOnState is None:
+      # Initial poweredOnState will be determined by this usage datum
+      poweredOnState = powerUsage > POWER_ON_THRESHOLD
+      if poweredOnState:
+        transition = "on"
+      else:
+        transition = "off"
+    elif poweredOnState is True and powerUsage < POWER_ON_THRESHOLD:
+      poweredOnState = False
+      transition = "off"
+    elif poweredOnState is False and powerUsage > POWER_ON_THRESHOLD:
+      poweredOnState = True
+      transition = "on"
+    return transition, poweredOnState
+
+def extractDataPoints(device, usageDataPoints, historyStartTime=None, historyEndTime=None, lastPoweredOnState=None):
+    poweredOnState = lastPoweredOnState
     excludedDetailChannelNumbers = ['Balance', 'TotalUsage']
     minutesInAnHour = 60
     secondsInAMinute = 60
@@ -127,7 +151,8 @@ def extractDataPoints(device, usageDataPoints, historyStartTime=None, historyEnd
         if kwhUsage is not None:
             watts = float(minutesInAnHour * wattsInAKw) * kwhUsage
             timestamp = stopTime
-            usageDataPoints.append(createDataPoint(account, chanName, watts, timestamp, False))
+            transition, poweredOnState = getPowerTransitionValue(poweredOnState, watts)
+            usageDataPoints.append(createDataPoint(account, chanName, watts, timestamp, False, transition))
 
         if chanNum in excludedDetailChannelNumbers:
             continue
@@ -152,8 +177,13 @@ def extractDataPoints(device, usageDataPoints, historyStartTime=None, historyEnd
                     continue
                 timestamp = historyStartTime + datetime.timedelta(minutes=index)
                 watts = float(minutesInAnHour * wattsInAKw) * kwhUsage
-                usageDataPoints.append(createDataPoint(account, chanName, watts, timestamp, False))
+                
+                transition, poweredOnState = getPowerTransitionValue(poweredOnState, watts)
+                               
+                usageDataPoints.append(createDataPoint(account, chanName, watts, timestamp, False, transition))
                 index += 1
+
+    return poweredOnState
 
 startupTime = datetime.datetime.utcnow()
 try:
@@ -161,7 +191,7 @@ try:
         print('Usage: python {} <config-file>'.format(sys.argv[0]))
         sys.exit(1)
 
-    configFilename = sys.argv[1]
+    configFilename = 'sys.argv[1]'
     config = {}
     with open(configFilename) as configFile:
         config = json.load(configFile)
@@ -174,9 +204,18 @@ try:
     write_api = None
     query_api = None
     sslVerify = True
-
+    debug = False
+    
     if 'ssl_verify' in config['influxDb']:
         sslVerify = config['influxDb']['ssl_verify']
+
+    if 'debug' in config['influxDb']:
+        debug = config['influxDb']['debug']
+
+    if 'powerOnThreshold' in config['influxDb']:
+        POWER_ON_THRESHOLD = config['influxDb']['powerOnThreshold']
+    else:
+        POWER_ON_THRESHOLD = 1
 
     if influxVersion == 2:
         info('Using InfluxDB version 2')
@@ -185,6 +224,7 @@ try:
         token = config['influxDb']['token']
         url= config['influxDb']['url']
         influx2 = influxdb_client.InfluxDBClient(
+           debug=debug,
            url=url,
            token=token,
            org=org,
@@ -197,27 +237,9 @@ try:
             info('Resetting database')
             delete_api = influx2.delete_api()
             start = "1970-01-01T00:00:00Z"
-            stop = startupTime.isoformat(timespec='seconds')
+            stop = startupTime.isoformat(timespec='seconds') + 'Z'    # Fixed ISO Format on stop time to include 'Z'
             delete_api.delete(start, stop, '_measurement="energy_usage"', bucket=bucket, org=org)    
-    else:
-        info('Using InfluxDB version 1')
-
-        sslEnable = False
-        if 'ssl_enable' in config['influxDb']:
-            sslEnable = config['influxDb']['ssl_enable']
-
-        # Only authenticate to ingress if 'user' entry was provided in config
-        if 'user' in config['influxDb']:
-            influx = influxdb.InfluxDBClient(host=config['influxDb']['host'], port=config['influxDb']['port'], username=config['influxDb']['user'], password=config['influxDb']['pass'], database=config['influxDb']['database'], ssl=sslEnable, verify_ssl=sslVerify)
-        else:
-            influx = influxdb.InfluxDBClient(host=config['influxDb']['host'], port=config['influxDb']['port'], database=config['influxDb']['database'], ssl=sslEnable, verify_ssl=sslVerify)
-
-        influx.create_database(config['influxDb']['database'])
-
-        if config['influxDb']['reset']:
-            info('Resetting database')
-            influx.delete_series(measurement='energy_usage')
-
+    
     historyDays = min(config['influxDb'].get('historyDays', 0), 7)
     history = historyDays > 0
 
@@ -234,6 +256,8 @@ try:
     info('Settings -> updateIntervalSecs: {}, detailedEnabled: {}, detailedIntervalSecs: {}'.format(intervalSecs, detailedDataEnabled, detailedIntervalSecs))
     lagSecs=getConfigValue("lagSecs", 5)
     detailedStartTime = startupTime
+
+    poweredOnState = {}
 
     while running:
         now = datetime.datetime.utcnow()
@@ -253,7 +277,9 @@ try:
                 if usages is not None:
                     usageDataPoints = []
                     for gid, device in usages.items():
-                        extractDataPoints(device, usageDataPoints)
+                        if device not in poweredOnState:
+                            poweredOnState[device] = None
+                        poweredOnState[device] = extractDataPoints(device, usageDataPoints, None, None, poweredOnState[device])
 
                     if history:
                         for day in range(historyDays):
@@ -262,13 +288,17 @@ try:
                             historyStartTime = stopTime - datetime.timedelta(seconds=3600*24*(day+1)-43200)
                             historyEndTime = stopTime - datetime.timedelta(seconds=(3600*24*(day)))
                             for gid, device in usages.items():
-                                extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime)
+                                if device not in poweredOnState:
+                                    poweredOnState[device] = None
+                                poweredOnState[device] = extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime, poweredOnState[device])
                             pauseEvent.wait(5)
                             #Extract first 12h of day
                             historyStartTime = stopTime - datetime.timedelta(seconds=3600*24*(day+1))
                             historyEndTime = stopTime - datetime.timedelta(seconds=(3600*24*(day+1))-43200)
                             for gid, device in usages.items():
-                                extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime)
+                                if device not in poweredOnState:
+                                    poweredOnState[device] = None
+                                poweredOnState[device] = extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime, poweredOnState[device])
                             if not running:
                                 break
                             pauseEvent.wait(5)
@@ -277,14 +307,14 @@ try:
                     if not running:
                         break
 
-                    info('Submitting datapoints to database; account="{}"; points={}'.format(account['name'], len(usageDataPoints)))
+                    info('Submitting datapoints to database; account="{}"; points={};'.format(account['name'], len(usageDataPoints)))
                     if influxVersion == 2:
-                        write_api.write(bucket=bucket, record=usageDataPoints)
-                    else:
-                        influx.write_points(usageDataPoints)
+                        write_api.write(bucket=bucket, org=org, record=usageDataPoints)
 
+            except ConnectTimeoutError:
+                error('Failed to record new usage data: ConnectTimeoutError')
             except:
-                error('Failed to record new usage data: {}'.format(sys.exc_info())) 
+                error('Failed to record new usage data: {}'.format(sys.exc_info()))
                 traceback.print_exc()
 
         if collectDetails:
