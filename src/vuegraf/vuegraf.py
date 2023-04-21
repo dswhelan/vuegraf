@@ -191,7 +191,7 @@ try:
         print('Usage: python {} <config-file>'.format(sys.argv[0]))
         sys.exit(1)
 
-    configFilename = 'sys.argv[1]'
+    configFilename = sys.argv[1]
     config = {}
     with open(configFilename) as configFile:
         config = json.load(configFile)
