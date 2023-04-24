@@ -277,11 +277,9 @@ try:
                 if usages is not None:
                     usageDataPoints = []
                     for gid, device in usages.items():
-                        if device not in poweredOnState:
-                            poweredOnState[device] = None
-                            info("poweredOnState[{}] initialized to None".format(device))
-                        poweredOnState[device] = extractDataPoints(device, usageDataPoints, None, None, poweredOnState[device])
-                        info("poweredOnState[{}]: {}".format(device, poweredOnState[device]))
+                        if gid not in poweredOnState:
+                            poweredOnState[gid] = None
+                        poweredOnState[gid] = extractDataPoints(device, usageDataPoints, None, None, poweredOnState[gid])
 
                     if history:
                         for day in range(historyDays):
@@ -290,17 +288,17 @@ try:
                             historyStartTime = stopTime - datetime.timedelta(seconds=3600*24*(day+1)-43200)
                             historyEndTime = stopTime - datetime.timedelta(seconds=(3600*24*(day)))
                             for gid, device in usages.items():
-                                if device not in poweredOnState:
-                                    poweredOnState[device] = None
-                                poweredOnState[device] = extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime, poweredOnState[device])
+                                if gid not in poweredOnState:
+                                    poweredOnState[gid] = None
+                                poweredOnState[gid] = extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime, poweredOnState[gid])
                             pauseEvent.wait(5)
                             #Extract first 12h of day
                             historyStartTime = stopTime - datetime.timedelta(seconds=3600*24*(day+1))
                             historyEndTime = stopTime - datetime.timedelta(seconds=(3600*24*(day+1))-43200)
                             for gid, device in usages.items():
                                 if device not in poweredOnState:
-                                    poweredOnState[device] = None
-                                poweredOnState[device] = extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime, poweredOnState[device])
+                                    poweredOnState[gid] = None
+                                poweredOnState[gid] = extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime, poweredOnState[gid])
                             if not running:
                                 break
                             pauseEvent.wait(5)
