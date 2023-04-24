@@ -279,7 +279,9 @@ try:
                     for gid, device in usages.items():
                         if device not in poweredOnState:
                             poweredOnState[device] = None
+                            info("poweredOnState[{}] initialized to None".format(device))
                         poweredOnState[device] = extractDataPoints(device, usageDataPoints, None, None, poweredOnState[device])
+                        info("poweredOnState[{}]: {}".format(device, poweredOnState[device]))
 
                     if history:
                         for day in range(historyDays):
